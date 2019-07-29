@@ -1,17 +1,21 @@
 ﻿module ryse
 open System.IO
+open System.Text.RegularExpressions
 open FSharp.Data
 open System
 open pragmaTypes
 open commonTypes
 open Amyris.Bio.utils
 open Amyris.Dna
+open Amyris.ErrorHandling
 //open System.Collections.Generic
 open System.Collections.Concurrent
 open constants
 open uri
 open sbolExample
 open AstTypes
+open PluginTypes
+open FetchPart
 
 // ==================================================================
 // RYSE megastitch architecture
@@ -19,14 +23,6 @@ open AstTypes
 
 /// RYSE verbose flag
 let private verbose = false
-type HutchRabit = {
-    id : int;
-    name : string;
-    five : string;
-    three : string;
-    orient : Orientation;
-    breed : string;
-    dnaSource : string}
 
 /// Load name\tsequence text file of RYSE linkers and return a map
 let loadRyseLinkers (f:string) =
@@ -45,79 +41,72 @@ let extractLinker (s:string ) =
     if s.StartsWith("Linker_") then s.[7..]
     else failwithf "ERROR: unable to parse linker name '%s'" s
 
-// FIXME: this should be injected rather than being a mutable global.
-let mutable private lookupUrlBase = None
+module ThumperPartProvider =
 
-/// Set the global URL used for looking up parts using RYCOD.
-let setPartLookupUrlBase urlBase = lookupUrlBase <- Some urlBase
+    type ThumperPartProvider(lookupUrlBase: string option, useCache: bool) =
+        let partLookupUrl route =
+            match lookupUrlBase with
+            | Some urlBase -> sprintf "%s/%s" urlBase route
+            | None -> failwith "No global url provided for part lookup."
+        let idRegex = Regex("^[Rr]\d+$")
+        // CAUTION: this cache can become stale when GSLC is embedded in a long-running application.
+        let fetchCache = new ConcurrentDictionary<string, ExtFetchSeq>()
+        do
+            ()
+        
 
-let partLookupUrl route =
-    match lookupUrlBase with
-    | Some urlBase -> sprintf "%s/%s" urlBase route
-    | None -> failwith "No global url provided for part lookup."
+        with
+        interface IPartProvider with
+            member __.ProvidedArgs() = [] // TODO: move to Amyris private repo and use existing thumperUrl arg.
+            member x.Configure(_) = x :> IPartProvider // TODO: use command line arg to set lookup URL.
+            member x.ConfigureFromOptions(_) = x :> IPartProvider
+            member x.Name = "thumper"
+            member x.Accept(partId) = idRegex.IsMatch(partId)
+            member x.Retrieve(partId) =
+                let route = sprintf "rycod/rabit_spec/%s" partId.[1..]
+                let url = partLookupUrl route
 
-// FIXME: this cache is global and mutable and can become stale when GSLC is embedded in a long-
-// running application.
-let private fetchCache = new ConcurrentDictionary<string,rycodExample.ThumperRycod.RyseComponentRequest>()
+                let lookup () =
+                    let response = Http.Request(url, silentHttpErrors = true)
+                    match response.Body with
+                    | Binary _ ->
+                        fail <| sprintf
+                            "Unexpected binary response from %s, with status code %d."
+                            url
+                            response.StatusCode
+                    | Text body ->
+                        if response.StatusCode = 200 then
+                            let rycod = rycodExample.ThumperRycod.Parse(body)
 
-/// Global flag to activate or deactivate caching of part fetch.
-/// Long-running clients of GSLC should set this flag to false to avoid building up a large cache
-/// that can become stale over time.
-let mutable useCache = true
+                            let rabit = rycod.RabitSpecs.[0]
 
-/// Hutch interaction: fetch part defs from RYCOd service and cache them.
-let getPart (route:string) =
+                            let linkers =
+                                let five = rabit.UpstreamLink.String |> Option.defaultValue ""
+                                let three = rabit.DownstreamLink.String |> Option.defaultValue ""
+                                Some(five, three)
 
-    let url = partLookupUrl route
+                            ok {
+                                name = rabit.Name
+                                dna = Dna(rabit.DnaElementSpecs.[0].DnaSequence)
+                                linkers = linkers
+                            }
+                        else
+                            fail <| sprintf
+                                "Request to %s failed with status code %d: %s."
+                                url
+                                response.StatusCode
+                                body
 
-    let lookup () =
-        let response = Http.Request(url, silentHttpErrors = true)
-        match response.Body with
-        | Binary _ ->
-            failwithf
-                "Unexpected binary response from %s, with status code %d."
-                url
-                response.StatusCode
-        | Text body ->
-            if response.StatusCode = 200 then
-                rycodExample.ThumperRycod.Parse(body)
-            else
-                failwithf 
-                    "Request to %s failed with status code %d: %s."
-                    url
-                    response.StatusCode
-                    body
-
-    if useCache then
-        match fetchCache.TryGetValue(url) with
-        | (true, x) -> x
-        | (false, _) ->
-            let result = lookup()
-            fetchCache.TryAdd(url, result) |> ignore
-            result
-    else
-        lookup()
-
-/// Get spec for rabit from hutch given rabit id
-let getRabit rId = sprintf "rycod/rabit_spec/%d" rId |> getPart
-
-/// Retrieve a Rabit specifiction from local cache or by making a thumper call.
-let getHutchInfoViaWeb ri =
-    let hr = getRabit ri
-    let rabit = hr.RabitSpecs.[0]
-    assert(rabit.Id.StartsWith("R."))
-
-    {id = int(rabit.Id.[2..]);
-     name = rabit.Name;
-     five = (match rabit.UpstreamLink.String with | Some(x) -> x | None -> "");
-     three = (match rabit.DownstreamLink.String with | None -> "" | Some(x) -> x);
-     orient =
-         match rabit.Direction with
-         | "FWD" -> FWD
-         | "REV" -> REV
-         | _ -> failwithf "inconceivable direction %A\n" rabit.Direction;
-     breed = rabit.Breed;
-     dnaSource = sprintf "R%d" ri}
+                if useCache then
+                    match fetchCache.TryGetValue(url) with
+                    | (true, x) -> ok x
+                    | (false, _) ->
+                        lookup()
+                        >>= (fun part ->
+                            fetchCache.TryAdd(url, part) |> ignore
+                            ok part)
+                else
+                    lookup()
 
 /// Determine which sets of linkers to use for a design
 let getLinkerSetsForDesign (aIn: DnaAssembly) =
@@ -397,12 +386,10 @@ let mapRyseLinkers
                     // Make sure linker is appropriate to precede part hd.
                     // Matters in the case where hd is reuse of a ryse part.
                     match hd.extId with
-                    | Some(x) -> //when x.[0] = 'R' || x.[0] = 'r' ->
-                        let rabitId = int(x)
-                        let h = getHutchInfoViaWeb rabitId
+                    | Some(extId) -> //when x.[0] = 'R' || x.[0] = 'r' ->
+                        let h = fetchPart extId |> returnOrFail
 
-                        let hFive = sprintf "%s" h.five
-                        let hThree = sprintf "%s" h.three
+                        let hFive, hThree = h.linkers |> Option.defaultValue ("", "")
 
                         let linkerName = extractLinker linker.description
                         let linkerNameNext =
@@ -412,8 +399,8 @@ let mapRyseLinkers
 
                         let failWithLinkerErrorMsg whichEnd hEnd name =
                             failwithf
-                                "part R%d expects %s linker (%s) and linker (%s) used instead \nERROR:(%s)"
-                                rabitId whichEnd hEnd name errorDesc
+                                "part %s expects %s linker (%s) and linker (%s) used instead \nERROR:(%s)"
+                                extId whichEnd hEnd name errorDesc
 
                         if phase then
                             if linkerName <> hFive then
